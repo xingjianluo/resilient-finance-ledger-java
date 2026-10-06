@@ -1,5 +1,6 @@
 package com.github.xingjianluo.resilientfinanceledgerjava.tests;
 
+import com.github.xingjianluo.resilientfinanceledgerjava.domain.EntryType;
 import com.github.xingjianluo.resilientfinanceledgerjava.domain.RejectionReason;
 import com.github.xingjianluo.resilientfinanceledgerjava.event.EventUpgradeException;
 import com.github.xingjianluo.resilientfinanceledgerjava.event.EventUpgrader;
@@ -47,13 +48,13 @@ class EventVersionCompatTest {
 
     @Test
     void unknownFutureVersionIsRejectedWithStableReason() {
-        System.out.println("[输入] 一条 V3（未来版本）事件");
+        System.out.println("[输入] 一条 V99（未来版本）事件");
         LedgerService ledger = new LedgerService(new EventStore(), new EventUpgrader());
         ledger.createAccount("t1", "A", "CNY", new BigDecimal("1000"));
         ledger.createAccount("t1", "B", "CNY", new BigDecimal("0"));
 
         EventUpgradeException ex = assertThrows(EventUpgradeException.class,
-                () -> ledger.replay(List.of(event(3, "future-1", "req-f", "10"))));
+                () -> ledger.replay(List.of(event(99, "future-1", "req-f", "10"))));
         System.out.println("[判定] 拒绝原因=" + ex.getReason() + ", 消息=" + ex.getMessage());
         System.out.println("[结果] A=" + ledger.balanceOf("t1", "A") + ", 流水条数="
                 + ledger.auditTrail("t1").size());
@@ -62,7 +63,8 @@ class EventVersionCompatTest {
                 "无法兼容的版本必须返回稳定原因码");
         assertEquals(0, new BigDecimal("1000").compareTo(ledger.balanceOf("t1", "A")),
                 "拒绝事件不得产生任何账务变动");
-        assertTrue(ledger.auditTrail("t1").isEmpty());
+        assertEquals(0, ledger.auditTrail("t1").stream()
+                .filter(e -> e.type() == EntryType.TRANSFER).count(), "拒绝事件不得产生转账流水");
     }
 
     @Test

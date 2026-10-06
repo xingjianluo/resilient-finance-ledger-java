@@ -1,5 +1,6 @@
 package com.github.xingjianluo.resilientfinanceledgerjava.tests;
 
+import com.github.xingjianluo.resilientfinanceledgerjava.domain.EntryType;
 import com.github.xingjianluo.resilientfinanceledgerjava.domain.TransferRequest;
 import com.github.xingjianluo.resilientfinanceledgerjava.domain.TransferResult;
 import com.github.xingjianluo.resilientfinanceledgerjava.domain.TransferStatus;
@@ -23,6 +24,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 并发转账：不得透支、丢失更新或重复入账，总额守恒。
  */
 class ConcurrentTransferTest {
+
+    private static long transferEntries(LedgerService ledger, String tenant) {
+        return ledger.auditTrail(tenant).stream().filter(e -> e.type() == EntryType.TRANSFER).count();
+    }
 
     @Test
     void concurrentTransfersNeverOverdraftAndConserveTotal() throws Exception {
@@ -67,7 +72,7 @@ class ConcurrentTransferTest {
                 + ", 总额=" + balanceA.add(balanceB) + ", 借贷守恒=" + ledger.isBalanced(tenant));
 
         assertEquals(threads, accepted + rejected, "每个请求必须有且仅有一个确定结果");
-        assertEquals(accepted, ledger.auditTrail(tenant).size(), "成功数必须等于流水条数（无丢失更新/重复入账）");
+        assertEquals(accepted, transferEntries(ledger, tenant), "成功数必须等于转账流水条数（无丢失更新/重复入账）");
         assertEquals(0, initial.add(initial).compareTo(balanceA.add(balanceB)), "总额必须守恒");
         assertTrue(balanceA.compareTo(BigDecimal.ZERO) >= 0 && balanceB.compareTo(BigDecimal.ZERO) >= 0,
                 "任何账户不得透支");
@@ -114,6 +119,6 @@ class ConcurrentTransferTest {
         assertEquals(100, insufficient, "其余 100 笔必须以 INSUFFICIENT_FUNDS 拒绝");
         assertEquals(0, BigDecimal.ZERO.compareTo(balanceA), "A 不得透支");
         assertEquals(0, new BigDecimal("1000").compareTo(balanceB), "B 必须恰好收到全部成功金额");
-        assertEquals(accepted, ledger.auditTrail(tenant).size());
+        assertEquals(accepted, transferEntries(ledger, tenant));
     }
 }

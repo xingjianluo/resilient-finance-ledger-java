@@ -75,7 +75,10 @@ class LedgerHttpApiTest {
 
         assertEquals(new BigDecimal("70"), new BigDecimal(balance.get("balance").toString()));
         assertEquals(new BigDecimal("500"), new BigDecimal(t2balance.get("balance").toString()));
-        assertEquals(1, audit.size());
+        long transferEntries = audit.stream()
+                .filter(e -> "TRANSFER".equals(((Map<?, ?>) e).get("type"))).count();
+        assertEquals(1, transferEntries, "转账流水恰好 1 条");
+        assertEquals(3, audit.size(), "流水 = 2 条期初 + 1 条转账");
         assertTrue(balanced);
 
         // V1 旧事件回放（requestId 为 null，模拟旧格式）
@@ -92,5 +95,25 @@ class LedgerHttpApiTest {
                 new HttpEntity<>(List.of(v1Event)), Map.class);
         System.out.println("[结果] V1 回放响应=" + replayResp);
         assertEquals(1, replayResp.get("applied"));
+
+        // 对账报告端点：t1 应一致，且不含 t2 账户
+        Map<?, ?> recon = rest.getForObject(url("/api/tenants/t1/reconciliation"), Map.class);
+        System.out.println("[判定] t1 对账: consistent=" + recon.get("consistent")
+                + ", 借方合计=" + recon.get("totalDebits") + ", 贷方合计=" + recon.get("totalCredits"));
+        assertEquals(Boolean.TRUE, recon.get("consistent"));
+        assertEquals(Boolean.TRUE, recon.get("totalsBalanced"));
+        assertEquals(2, ((List<?>) recon.get("accounts")).size(), "报告只含本租户账户");
+
+        // 开户事件经 HTTP 回放（eventType=ACCOUNT_OPENED），可还原账户与期初余额
+        Map<String, Object> openEvent = Map.of(
+                "eventType", "ACCOUNT_OPENED", "version", 1,
+                "tenantId", "t3", "accountId", "C", "currency", "CNY",
+                "initialBalance", new BigDecimal("88"));
+        Map<?, ?> openReplay = rest.postForObject(url("/api/replay"),
+                new HttpEntity<>(List.of(openEvent)), Map.class);
+        Map<?, ?> cBalance = rest.getForObject(url("/api/tenants/t3/accounts/C/balance"), Map.class);
+        System.out.println("[结果] 开户事件回放响应=" + openReplay + ", t3.C 余额=" + cBalance.get("balance"));
+        assertEquals(1, openReplay.get("applied"));
+        assertEquals(new BigDecimal("88"), new BigDecimal(cBalance.get("balance").toString()));
     }
 }

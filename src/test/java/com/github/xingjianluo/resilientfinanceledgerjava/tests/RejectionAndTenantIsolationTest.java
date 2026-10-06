@@ -1,5 +1,6 @@
 package com.github.xingjianluo.resilientfinanceledgerjava.tests;
 
+import com.github.xingjianluo.resilientfinanceledgerjava.domain.EntryType;
 import com.github.xingjianluo.resilientfinanceledgerjava.domain.RejectionReason;
 import com.github.xingjianluo.resilientfinanceledgerjava.domain.TransferRequest;
 import com.github.xingjianluo.resilientfinanceledgerjava.domain.TransferResult;
@@ -30,6 +31,10 @@ class RejectionAndTenantIsolationTest {
         ledger.createAccount("t1", "B", "CNY", new BigDecimal("0"));
         ledger.createAccount("t1", "USD1", "USD", new BigDecimal("100"));
         ledger.createAccount("t2", "A", "CNY", new BigDecimal("999")); // 他租户同名账户
+    }
+
+    private long transferEntries(String tenant) {
+        return ledger.auditTrail(tenant).stream().filter(e -> e.type() == EntryType.TRANSFER).count();
     }
 
     private TransferResult submit(String requestId, String tenant, String from, String to,
@@ -64,7 +69,7 @@ class RejectionAndTenantIsolationTest {
                 + ", t1 流水条数=" + ledger.auditTrail("t1").size());
         assertEquals(6, ledger.rejectionAudit("t1").size());
         assertEquals(1, ledger.rejectionAudit("t2").size());
-        assertTrue(ledger.auditTrail("t1").isEmpty(), "全部被拒绝，不得产生流水");
+        assertEquals(0, transferEntries("t1"), "全部被拒绝，不得产生转账流水");
         assertEquals(0, new BigDecimal("100").compareTo(ledger.balanceOf("t1", "A")), "余额不得变动");
     }
 
@@ -81,8 +86,8 @@ class RejectionAndTenantIsolationTest {
 
         assertEquals(0, new BigDecimal("60").compareTo(ledger.balanceOf("t1", "A")));
         assertEquals(0, new BigDecimal("999").compareTo(ledger.balanceOf("t2", "A")), "他租户余额互不影响");
-        assertEquals(1, ledger.auditTrail("t1").size());
-        assertTrue(ledger.auditTrail("t2").isEmpty(), "t2 看不到 t1 的流水");
+        assertEquals(1, transferEntries("t1"));
+        assertEquals(0, transferEntries("t2"), "t2 看不到 t1 的转账流水");
         assertThrows(IllegalArgumentException.class,
                 () -> ledger.balanceOf("t2", "B"), "t2 查询 t1 的账户必须不可见");
         System.out.println("[结果] 租户隔离验证通过");
