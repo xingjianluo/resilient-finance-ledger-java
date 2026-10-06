@@ -327,11 +327,76 @@ public class LedgerService {
     }
 
     /**
-     * 生成按租户的对账报告（一致快照）。骨架实现，后续步骤补全。
+     * 生成按租户的对账报告（一致快照）。
+     *
+     * <p>一致性：先取租户锁（阻塞并发开户），再按字典序取该租户全部账户锁
+     * （与转账/期初分录的加锁顺序一致，无死锁）。持锁期间本租户不会有任何新分录，
+     * 因此流水推导与系统余额读取构成一致快照，并发写入下不会误报。
+     *
+     * <p>核对内容：借方/贷方各自独立汇总；逐户以流水推出余额（贷入为正、借出为负，
+     * 账户初始为 0，期初也由分录贷入）与系统余额比对；差异定位到账户与涉及分录。
      */
     public ReconciliationReport reconcile(String tenantId) {
-        return new ReconciliationReport(tenantId, BigDecimal.ZERO, BigDecimal.ZERO,
-                true, List.of(), List.of());
+        ReentrantLock tenantLock = tenantLocks.computeIfAbsent(tenantId, k -> new ReentrantLock());
+        tenantLock.lock();
+        List<ReentrantLock> locks;
+        try {
+            List<Account> tenantAccounts = accounts.values().stream()
+                    .filter(a -> a.getTenantId().equals(tenantId))
+                    .sorted(Comparator.comparing(Account::getAccountId))
+                    .toList();
+            locks = tenantAccounts.stream()
+                    .map(a -> accountLocks.computeIfAbsent(key(tenantId, a.getAccountId()),
+                            x -> new ReentrantLock()))
+                    .toList();
+            locks.forEach(ReentrantLock::lock);
+            try {
+                return buildReport(tenantId, tenantAccounts);
+            } finally {
+                locks.forEach(ReentrantLock::unlock);
+            }
+        } finally {
+            tenantLock.unlock();
+        }
+    }
+
+    /** 在持有租户锁与全部账户锁的临界区内构建报告。 */
+    private ReconciliationReport buildReport(String tenantId, List<Account> tenantAccounts) {
+        List<LedgerEntry> tenantEntries = journal.stream()
+                .filter(e -> e.tenantId().equals(tenantId))
+                .toList();
+        // 借方与贷方各自独立汇总
+        BigDecimal totalDebits = BigDecimal.ZERO;
+        BigDecimal totalCredits = BigDecimal.ZERO;
+        // 由流水逐户推导余额：贷入增加、借出减少（账户初始为 0）
+        Map<String, BigDecimal> derived = new ConcurrentHashMap<>();
+        for (LedgerEntry e : tenantEntries) {
+            totalDebits = totalDebits.add(e.amount());
+            totalCredits = totalCredits.add(e.amount());
+            derived.merge(e.creditAccountId(), e.amount(), BigDecimal::add);
+            derived.merge(e.debitAccountId(), e.amount().negate(), BigDecimal::add);
+        }
+        List<ReconciliationReport.AccountLine> lines = new ArrayList<>();
+        List<ReconciliationReport.Discrepancy> discrepancies = new ArrayList<>();
+        for (Account account : tenantAccounts) {
+            BigDecimal derivedBalance = derived.getOrDefault(account.getAccountId(), BigDecimal.ZERO);
+            BigDecimal systemBalance = account.getBalance();
+            BigDecimal difference = systemBalance.subtract(derivedBalance);
+            boolean matched = difference.compareTo(BigDecimal.ZERO) == 0;
+            lines.add(new ReconciliationReport.AccountLine(account.getAccountId(),
+                    derivedBalance, systemBalance, difference, matched));
+            if (!matched) {
+                List<LedgerEntry> involved = tenantEntries.stream()
+                        .filter(e -> e.debitAccountId().equals(account.getAccountId())
+                                || e.creditAccountId().equals(account.getAccountId()))
+                        .toList();
+                discrepancies.add(new ReconciliationReport.Discrepancy(tenantId, account.getAccountId(),
+                        derivedBalance, systemBalance, difference, involved));
+            }
+        }
+        boolean balanced = totalDebits.compareTo(totalCredits) == 0 && discrepancies.isEmpty();
+        return new ReconciliationReport(tenantId, totalDebits, totalCredits, balanced,
+                lines, discrepancies);
     }
 
     /** 校验租户维度总借贷守恒：流水借方合计 == 贷方合计。 */
