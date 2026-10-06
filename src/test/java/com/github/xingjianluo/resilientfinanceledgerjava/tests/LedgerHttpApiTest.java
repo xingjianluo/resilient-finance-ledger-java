@@ -75,7 +75,7 @@ class LedgerHttpApiTest {
 
         assertEquals(new BigDecimal("70"), new BigDecimal(balance.get("balance").toString()));
         assertEquals(new BigDecimal("500"), new BigDecimal(t2balance.get("balance").toString()));
-        assertEquals(1, audit.size());
+        assertEquals(2, audit.size(), "t1：1 条期初分录 + 1 条转账分录");
         assertTrue(balanced);
 
         // V1 旧事件回放（requestId 为 null，模拟旧格式）

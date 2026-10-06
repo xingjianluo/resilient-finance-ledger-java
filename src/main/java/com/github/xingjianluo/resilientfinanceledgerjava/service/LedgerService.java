@@ -4,9 +4,12 @@ import com.github.xingjianluo.resilientfinanceledgerjava.domain.Account;
 import com.github.xingjianluo.resilientfinanceledgerjava.domain.LedgerEntry;
 import com.github.xingjianluo.resilientfinanceledgerjava.domain.RejectionAudit;
 import com.github.xingjianluo.resilientfinanceledgerjava.domain.RejectionReason;
+import com.github.xingjianluo.resilientfinanceledgerjava.domain.ReconciliationReport;
 import com.github.xingjianluo.resilientfinanceledgerjava.domain.TransferRequest;
 import com.github.xingjianluo.resilientfinanceledgerjava.domain.TransferResult;
+import com.github.xingjianluo.resilientfinanceledgerjava.event.AccountOpenedEvent;
 import com.github.xingjianluo.resilientfinanceledgerjava.event.EventUpgrader;
+import com.github.xingjianluo.resilientfinanceledgerjava.event.LedgerEvent;
 import com.github.xingjianluo.resilientfinanceledgerjava.event.TransactionEvent;
 import org.springframework.stereotype.Service;
 
@@ -36,6 +39,9 @@ import java.util.concurrent.locks.ReentrantLock;
 @Service
 public class LedgerService {
 
+    /** 系统期初权益账户（每租户一个）：期初分录的借方，解释期初余额来源。 */
+    public static final String OPENING_EQUITY_ACCOUNT = "SYSTEM_OPENING_EQUITY";
+
     private final EventStore eventStore;
     private final EventUpgrader eventUpgrader;
 
@@ -43,6 +49,8 @@ public class LedgerService {
     private final Map<String, Account> accounts = new ConcurrentHashMap<>();
     /** 账户锁：key = tenantId|accountId */
     private final Map<String, ReentrantLock> accountLocks = new ConcurrentHashMap<>();
+    /** 租户锁：key = tenantId；开户与对账快照使用，锁顺序恒为 租户锁 -> 账户锁（按字典序） */
+    private final Map<String, ReentrantLock> tenantLocks = new ConcurrentHashMap<>();
     /** 幂等结果表：key = tenantId|requestId */
     private final Map<String, CompletableFuture<TransferResult>> idempotencyTable = new ConcurrentHashMap<>();
     /** 审计流水（只追加） */
@@ -59,13 +67,86 @@ public class LedgerService {
         return tenantId + "|" + id;
     }
 
+    /**
+     * 开户。期初余额按复式记账落账：借 系统期初权益账户 / 贷 新账户，
+     * 并先追加开户事件——账户与期初均可由事件回放还原，余额可由流水逐步推出。
+     */
     public void createAccount(String tenantId, String accountId, String currency, BigDecimal initialBalance) {
+        createAccount(tenantId, accountId, currency, initialBalance, null);
+    }
+
+    public void createAccount(String tenantId, String accountId, String currency,
+                              BigDecimal initialBalance, String businessRef) {
         if (initialBalance == null || initialBalance.compareTo(BigDecimal.ZERO) < 0) {
             throw new IllegalArgumentException("initial balance must be >= 0");
         }
-        Account account = new Account(tenantId, accountId, currency, initialBalance);
-        if (accounts.putIfAbsent(key(tenantId, accountId), account) != null) {
-            throw new IllegalArgumentException("account already exists: " + key(tenantId, accountId));
+        ReentrantLock tenantLock = tenantLocks.computeIfAbsent(tenantId, k -> new ReentrantLock());
+        tenantLock.lock();
+        try {
+            if (accounts.containsKey(key(tenantId, accountId))) {
+                throw new IllegalArgumentException("account already exists: " + key(tenantId, accountId));
+            }
+            if (initialBalance.compareTo(BigDecimal.ZERO) > 0) {
+                ensureOpeningEquityAccount(tenantId, currency);
+            }
+            // 事件先行：开户事件追加成功后才变动账户状态
+            AccountOpenedEvent event = new AccountOpenedEvent(
+                    AccountOpenedEvent.CURRENT_VERSION, "open-" + accountId,
+                    tenantId, accountId, currency, initialBalance, businessRef);
+            long seq = eventStore.append(event);
+            applyAccountOpenedState(event, seq);
+        } finally {
+            tenantLock.unlock();
+        }
+    }
+
+    /** 确保租户的系统期初权益账户存在（调用方须持有租户锁）。 */
+    private void ensureOpeningEquityAccount(String tenantId, String currency) {
+        accounts.putIfAbsent(key(tenantId, OPENING_EQUITY_ACCOUNT),
+                new Account(tenantId, OPENING_EQUITY_ACCOUNT, currency, BigDecimal.ZERO));
+    }
+
+    /**
+     * 应用开户事件到账户状态（事件须已追加）。幂等：账户已存在则跳过。
+     * 账户余额从 0 开始，正期初以期初分录贷入，保证余额可由流水逐步推出。
+     *
+     * @return 是否为新应用（false = 重复事件被跳过）
+     */
+    private boolean applyAccountOpenedState(AccountOpenedEvent event, long seq) {
+        String accountKey = key(event.tenantId(), event.accountId());
+        if (accounts.containsKey(accountKey)) {
+            return false;
+        }
+        if (event.openingBalance().compareTo(BigDecimal.ZERO) > 0) {
+            ensureOpeningEquityAccount(event.tenantId(), event.currency());
+        }
+        accounts.put(accountKey, new Account(event.tenantId(), event.accountId(),
+                event.currency(), BigDecimal.ZERO));
+        if (event.openingBalance().compareTo(BigDecimal.ZERO) > 0) {
+            postOpeningEntry(event, seq);
+        }
+        return true;
+    }
+
+    /** 期初分录：借 系统期初权益账户，贷 新账户；在双方账户锁内记录过账后余额。 */
+    private void postOpeningEntry(AccountOpenedEvent event, long seq) {
+        String equityKey = key(event.tenantId(), OPENING_EQUITY_ACCOUNT);
+        String accountKey = key(event.tenantId(), event.accountId());
+        List<ReentrantLock> locks = java.util.stream.Stream.of(equityKey, accountKey)
+                .sorted()
+                .map(k -> accountLocks.computeIfAbsent(k, x -> new ReentrantLock()))
+                .toList();
+        locks.forEach(ReentrantLock::lock);
+        try {
+            Account equity = accounts.get(equityKey);
+            Account fresh = accounts.get(accountKey);
+            equity.debit(event.openingBalance());
+            fresh.credit(event.openingBalance());
+            journal.add(new LedgerEntry(seq, event.eventId(), event.eventId(), event.tenantId(),
+                    OPENING_EQUITY_ACCOUNT, event.accountId(), event.openingBalance(), event.currency(),
+                    equity.getBalance(), fresh.getBalance(), Instant.now()));
+        } finally {
+            locks.forEach(ReentrantLock::unlock);
         }
     }
 
@@ -135,7 +216,7 @@ public class LedgerService {
             TransactionEvent event = new TransactionEvent(
                     TransactionEvent.CURRENT_VERSION, transactionId, request.requestId(),
                     request.tenantId(), request.fromAccountId(), request.toAccountId(),
-                    request.amount(), request.currency());
+                    request.amount(), request.currency(), request.businessRef());
             long seq = eventStore.append(event);
             applyPosting(event, seq);
             return TransferResult.accepted(transactionId);
@@ -151,7 +232,8 @@ public class LedgerService {
         from.debit(event.amount());
         to.credit(event.amount());
         journal.add(new LedgerEntry(seq, event.transactionId(), event.requestId(), event.tenantId(),
-                event.fromAccountId(), event.toAccountId(), event.amount(), event.currency(), Instant.now()));
+                event.fromAccountId(), event.toAccountId(), event.amount(), event.currency(),
+                from.getBalance(), to.getBalance(), Instant.now()));
     }
 
     private boolean existsUnderOtherTenant(String accountId, String tenantId) {
@@ -186,35 +268,70 @@ public class LedgerService {
     }
 
     /**
-     * 回放事件：逐条升级到当前版本后按幂等键去重应用。
-     * 乱序与重复安全：每条事件自包含，求和可交换，最终余额一致。
+     * 回放事件：逐条升级到当前版本后应用。
+     * 两段式：先应用开户事件（乱序时交易事件可能先于其账户的开户事件到达），
+     * 再应用交易事件（按幂等键去重）。乱序与重复安全，最终余额一致。
      * 已确认事件在回放时不再做余额检查（提交时已校验）。
      *
      * @return 本次实际新应用的事件数
      */
-    public int replay(List<TransactionEvent> events) {
+    public int replay(List<? extends LedgerEvent> events) {
+        List<LedgerEvent> upgraded = new ArrayList<>();
+        for (LedgerEvent raw : events) {
+            upgraded.add(eventUpgrader.upgradeToCurrent(raw)); // 不兼容则抛出，明确拒绝
+        }
         int applied = 0;
-        for (TransactionEvent raw : events) {
-            TransactionEvent event = eventUpgrader.upgradeToCurrent(raw); // 不兼容则抛出，明确拒绝
-            String idemKey = key(event.tenantId(), event.requestId());
-            CompletableFuture<TransferResult> marker = new CompletableFuture<>();
-            if (idempotencyTable.putIfAbsent(idemKey, marker) != null) {
-                continue; // 重复事件：跳过，不重复入账
+        // 第一段：开户事件（按账户存在性去重，可乱序）
+        for (LedgerEvent event : upgraded) {
+            if (event instanceof AccountOpenedEvent opened && applyAccountOpened(opened)) {
+                applied++;
             }
-            Account from = accounts.get(key(event.tenantId(), event.fromAccountId()));
-            Account to = accounts.get(key(event.tenantId(), event.toAccountId()));
-            if (from == null || to == null) {
-                idempotencyTable.remove(idemKey, marker);
-                throw new com.github.xingjianluo.resilientfinanceledgerjava.event.EventUpgradeException(
-                        RejectionReason.EVENT_VALIDATION_FAILED,
-                        "replay references unknown account: " + event);
+        }
+        // 第二段：交易事件（按幂等键去重）
+        for (LedgerEvent event : upgraded) {
+            if (event instanceof TransactionEvent tx && applyTransaction(tx)) {
+                applied++;
             }
-            long seq = eventStore.append(event);
-            applyPosting(event, seq);
-            marker.complete(TransferResult.accepted(event.transactionId()));
-            applied++;
         }
         return applied;
+    }
+
+    /** 回放开户事件：追加到本事件存储后应用；账户已存在则跳过（幂等）。 */
+    private boolean applyAccountOpened(AccountOpenedEvent event) {
+        if (accounts.containsKey(key(event.tenantId(), event.accountId()))) {
+            return false; // 重复开户事件：跳过
+        }
+        long seq = eventStore.append(event);
+        return applyAccountOpenedState(event, seq);
+    }
+
+    /** 回放交易事件：幂等键已存在则跳过。 */
+    private boolean applyTransaction(TransactionEvent event) {
+        String idemKey = key(event.tenantId(), event.requestId());
+        CompletableFuture<TransferResult> marker = new CompletableFuture<>();
+        if (idempotencyTable.putIfAbsent(idemKey, marker) != null) {
+            return false; // 重复事件：跳过，不重复入账
+        }
+        Account from = accounts.get(key(event.tenantId(), event.fromAccountId()));
+        Account to = accounts.get(key(event.tenantId(), event.toAccountId()));
+        if (from == null || to == null) {
+            idempotencyTable.remove(idemKey, marker);
+            throw new com.github.xingjianluo.resilientfinanceledgerjava.event.EventUpgradeException(
+                    RejectionReason.EVENT_VALIDATION_FAILED,
+                    "replay references unknown account: " + event);
+        }
+        long seq = eventStore.append(event);
+        applyPosting(event, seq);
+        marker.complete(TransferResult.accepted(event.transactionId()));
+        return true;
+    }
+
+    /**
+     * 生成按租户的对账报告（一致快照）。骨架实现，后续步骤补全。
+     */
+    public ReconciliationReport reconcile(String tenantId) {
+        return new ReconciliationReport(tenantId, BigDecimal.ZERO, BigDecimal.ZERO,
+                true, List.of(), List.of());
     }
 
     /** 校验租户维度总借贷守恒：流水借方合计 == 贷方合计。 */

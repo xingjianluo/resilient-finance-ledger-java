@@ -67,7 +67,8 @@ class ConcurrentTransferTest {
                 + ", 总额=" + balanceA.add(balanceB) + ", 借贷守恒=" + ledger.isBalanced(tenant));
 
         assertEquals(threads, accepted + rejected, "每个请求必须有且仅有一个确定结果");
-        assertEquals(accepted, ledger.auditTrail(tenant).size(), "成功数必须等于流水条数（无丢失更新/重复入账）");
+        assertEquals(accepted + 2, ledger.auditTrail(tenant).size(),
+                "2 条期初分录 + 成功转账分录（无丢失更新/重复入账）");
         assertEquals(0, initial.add(initial).compareTo(balanceA.add(balanceB)), "总额必须守恒");
         assertTrue(balanceA.compareTo(BigDecimal.ZERO) >= 0 && balanceB.compareTo(BigDecimal.ZERO) >= 0,
                 "任何账户不得透支");
@@ -114,6 +115,6 @@ class ConcurrentTransferTest {
         assertEquals(100, insufficient, "其余 100 笔必须以 INSUFFICIENT_FUNDS 拒绝");
         assertEquals(0, BigDecimal.ZERO.compareTo(balanceA), "A 不得透支");
         assertEquals(0, new BigDecimal("1000").compareTo(balanceB), "B 必须恰好收到全部成功金额");
-        assertEquals(accepted, ledger.auditTrail(tenant).size());
+        assertEquals(accepted + 1, ledger.auditTrail(tenant).size(), "1 条期初分录 + 成功转账分录");
     }
 }

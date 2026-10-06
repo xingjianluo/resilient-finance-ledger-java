@@ -18,7 +18,8 @@ public final class ApiDtos {
     }
 
     public record TransferHttpRequest(String requestId, String tenantId, String fromAccountId,
-                                      String toAccountId, BigDecimal amount, String currency) {
+                                      String toAccountId, BigDecimal amount, String currency,
+                                      String businessRef) {
     }
 
     public record TransferHttpResponse(TransferStatus status, RejectionReason reason,

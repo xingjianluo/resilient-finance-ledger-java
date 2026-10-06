@@ -1,12 +1,13 @@
 package com.github.xingjianluo.resilientfinanceledgerjava.api;
 
 import com.github.xingjianluo.resilientfinanceledgerjava.domain.LedgerEntry;
+import com.github.xingjianluo.resilientfinanceledgerjava.domain.ReconciliationReport;
 import com.github.xingjianluo.resilientfinanceledgerjava.domain.RejectionAudit;
 import com.github.xingjianluo.resilientfinanceledgerjava.domain.TransferRequest;
 import com.github.xingjianluo.resilientfinanceledgerjava.domain.TransferResult;
 import com.github.xingjianluo.resilientfinanceledgerjava.domain.TransferStatus;
 import com.github.xingjianluo.resilientfinanceledgerjava.event.EventUpgradeException;
-import com.github.xingjianluo.resilientfinanceledgerjava.event.TransactionEvent;
+import com.github.xingjianluo.resilientfinanceledgerjava.event.LedgerEvent;
 import com.github.xingjianluo.resilientfinanceledgerjava.service.LedgerService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -46,7 +47,7 @@ public class LedgerController {
     public ResponseEntity<ApiDtos.TransferHttpResponse> transfer(@RequestBody ApiDtos.TransferHttpRequest req) {
         TransferResult result = ledgerService.transfer(new TransferRequest(
                 req.requestId(), req.tenantId(), req.fromAccountId(), req.toAccountId(),
-                req.amount(), req.currency()));
+                req.amount(), req.currency(), req.businessRef()));
         ApiDtos.TransferHttpResponse body = new ApiDtos.TransferHttpResponse(
                 result.status(), result.reason(), result.transactionId());
         // 拒绝以 422 返回稳定原因码；成功/幂等命中返回 200
@@ -81,9 +82,15 @@ public class LedgerController {
         return ledgerService.isBalanced(tenantId);
     }
 
+    /** 对账报告：按租户的一致快照，含借贷汇总、逐户核对与差异定位。 */
+    @GetMapping("/tenants/{tenantId}/reconciliation")
+    public ReconciliationReport reconciliation(@PathVariable String tenantId) {
+        return ledgerService.reconcile(tenantId);
+    }
+
     /** 事件回放：支持乱序、重复与旧版本事件；不兼容事件明确拒绝（422 + 稳定原因码）。 */
     @PostMapping("/replay")
-    public ResponseEntity<?> replay(@RequestBody List<TransactionEvent> events) {
+    public ResponseEntity<?> replay(@RequestBody List<LedgerEvent> events) {
         try {
             int applied = ledgerService.replay(events);
             return ResponseEntity.ok(new ApiDtos.ReplayResponse(applied, events.size()));

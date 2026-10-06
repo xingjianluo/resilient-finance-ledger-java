@@ -46,7 +46,7 @@ class IdempotencyTest {
         assertEquals(r1.transactionId(), r2.transactionId(), "幂等命中必须返回首次交易号");
         assertEquals(0, new BigDecimal("400").compareTo(ledger.balanceOf("t1", "A")), "只入账一次");
         assertEquals(0, new BigDecimal("100").compareTo(ledger.balanceOf("t1", "B")));
-        assertEquals(1, ledger.auditTrail("t1").size(), "不得重复生成流水");
+        assertEquals(2, ledger.auditTrail("t1").size(), "1 条期初分录 + 1 条转账分录，不得重复生成流水");
     }
 
     @Test
@@ -84,7 +84,7 @@ class IdempotencyTest {
         assertEquals(1, accepted, "并发下同键请求只允许一笔成功");
         assertEquals(threads - 1, duplicates);
         assertEquals(0, new BigDecimal("100").compareTo(ledger.balanceOf("t1", "B")), "只入账一次");
-        assertEquals(1, ledger.auditTrail("t1").size());
+        assertEquals(2, ledger.auditTrail("t1").size(), "1 条期初分录 + 1 条转账分录");
     }
 
     @Test
@@ -105,7 +105,7 @@ class IdempotencyTest {
         assertEquals(RejectionReason.INSUFFICIENT_FUNDS, r1.reason());
         assertEquals(RejectionReason.INSUFFICIENT_FUNDS, r2.reason(), "重试必须返回相同的稳定原因");
         assertEquals(0, new BigDecimal("50").compareTo(ledger.balanceOf("t1", "A")), "拒绝不得变动余额");
-        assertTrue(ledger.auditTrail("t1").isEmpty(), "拒绝不得生成流水");
+        assertEquals(1, ledger.auditTrail("t1").size(), "拒绝不得新增流水（仅开户期初分录）");
         assertEquals(1, ledger.rejectionAudit("t1").size(), "拒绝原因必须可审计");
     }
 }

@@ -64,7 +64,7 @@ class RejectionAndTenantIsolationTest {
                 + ", t1 流水条数=" + ledger.auditTrail("t1").size());
         assertEquals(6, ledger.rejectionAudit("t1").size());
         assertEquals(1, ledger.rejectionAudit("t2").size());
-        assertTrue(ledger.auditTrail("t1").isEmpty(), "全部被拒绝，不得产生流水");
+        assertEquals(2, ledger.auditTrail("t1").size(), "全部被拒绝，不得新增流水（仅 2 条开户期初分录）");
         assertEquals(0, new BigDecimal("100").compareTo(ledger.balanceOf("t1", "A")), "余额不得变动");
     }
 
@@ -81,8 +81,8 @@ class RejectionAndTenantIsolationTest {
 
         assertEquals(0, new BigDecimal("60").compareTo(ledger.balanceOf("t1", "A")));
         assertEquals(0, new BigDecimal("999").compareTo(ledger.balanceOf("t2", "A")), "他租户余额互不影响");
-        assertEquals(1, ledger.auditTrail("t1").size());
-        assertTrue(ledger.auditTrail("t2").isEmpty(), "t2 看不到 t1 的流水");
+        assertEquals(3, ledger.auditTrail("t1").size(), "t1：2 条期初分录 + 1 条转账分录");
+        assertEquals(1, ledger.auditTrail("t2").size(), "t2 看不到 t1 的流水（仅自身期初分录）");
         assertThrows(IllegalArgumentException.class,
                 () -> ledger.balanceOf("t2", "B"), "t2 查询 t1 的账户必须不可见");
         System.out.println("[结果] 租户隔离验证通过");
